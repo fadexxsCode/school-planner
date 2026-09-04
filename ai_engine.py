@@ -14,6 +14,12 @@ TRASH_WORDS = [
     "лайно", "дурниця", "сміття", "забий", "нісенітниця"
 ]
 
+# Ключові слова, що вказують на "великий" тип роботи — такі завдання
+# вимагають більше часу на підготовку, тож підсвічуємо їх завчасно.
+URGENT_TYPE_KEYWORDS = ["проект", "реферат"]
+
+URGENT_DAYS_THRESHOLD = 2
+
 
 class AIEngine:
     def __init__(self, data_manager):
@@ -111,26 +117,47 @@ class AIEngine:
             return False, trash_msg
         return True, "OK"
 
-    def calculate_priority(self, item: dict) -> float:
-        score = 0.0
-        today = datetime.now().date()
-
+    def _days_left(self, item: dict):
+        """Кількість днів до дедлайну, або None, якщо дату не вдалося розібрати."""
         try:
             deadline_date = datetime.strptime(item["deadline"], "%d.%m.%Y").date()
-            days_left = (deadline_date - today).days
-
-            if days_left == 0:
-                score += 1000
-            elif days_left < 0:
-                score += 500
-            elif days_left == 1:
-                score += 80
-            elif days_left <= 3:
-                score += 50
-            else:
-                score += max(5, 30 - days_left * 2)
+            return (deadline_date - datetime.now().date()).days
         except (ValueError, KeyError):
-            score += 10
+            return None
+
+    def is_overdue_task(self, item: dict) -> bool:
+        """True, якщо дедлайн уже минув."""
+        days_left = self._days_left(item)
+        return days_left is not None and days_left < 0
+
+    def is_urgent_task(self, item: dict) -> bool:
+        """Позначає завдання як 'горить' — без звернення до ШІ, лише за
+        датою дедлайну (менше URGENT_DAYS_THRESHOLD днів, включно з
+        простроченими) або за типом роботи (проект/реферат у описі)."""
+        days_left = self._days_left(item)
+        if days_left is not None and days_left < URGENT_DAYS_THRESHOLD:
+            return True
+
+        description = item.get("description", "").lower()
+        return any(keyword in description for keyword in URGENT_TYPE_KEYWORDS)
+
+    def calculate_priority(self, item: dict) -> float:
+        """Пріоритет для сортування списку активних завдань. Три чіткі рівні:
+        1) прострочені — завжди зверху, чим довше прострочено, тим вище;
+        2) 'гарячі' (дедлайн сьогодні/завтра або тип проект/реферат);
+        3) решта — за наближенням дедлайну."""
+        days_left = self._days_left(item)
+        is_overdue = self.is_overdue_task(item)
+        is_urgent = self.is_urgent_task(item)
+
+        if is_overdue:
+            score = 10_000 + abs(days_left)
+        elif is_urgent:
+            score = 5_000 - (days_left or 0)
+        elif days_left is not None:
+            score = max(0, 1_000 - days_left)
+        else:
+            score = 10  # некоректна/відсутня дата дедлайну
 
         text_length = len(item.get("description", ""))
         if text_length > 100:

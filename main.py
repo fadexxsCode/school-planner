@@ -20,9 +20,19 @@ TRANSLATIONS = {
         "warn_title": "Попередження ШІ",
         "btn_complete": "✓ Виконано",
         "today_tag": "🔥 СЬОГОДНІ",
+        "overdue_tag": "❌ ПРОСТРОЧЕНО!",
         "edit_day_title": "Редагування розкладу на",
         "btn_save": "Зберегти розклад",
-        "no_lessons": "Уроків не додано. Натисніть 'Редагувати', щоб заповнити день."
+        "no_lessons": "Уроків не додано. Натисніть 'Редагувати', щоб заповнити день.",
+        "confirm_complete_title": "Підтвердження",
+        "confirm_complete_msg": "Точно виконано?",
+        "btn_yes": "Так",
+        "btn_no": "Скасувати",
+        "edit_hw_title": "Редагування завдання",
+        "field_subject": "Предмет:",
+        "field_deadline": "Дедлайн (ДД.ММ.РРРР):",
+        "field_description": "Опис завдання:",
+        "btn_save_changes": "Зберегти зміни"
     },
     "RU": {
         "tab_hw": "Домашнее задание",
@@ -35,13 +45,28 @@ TRANSLATIONS = {
         "warn_title": "Предупреждение ИИ",
         "btn_complete": "✓ Выполнено",
         "today_tag": "🔥 СЕГОДНЯ",
+        "overdue_tag": "❌ ПРОСРОЧЕНО!",
         "edit_day_title": "Редактирование расписания на",
         "btn_save": "Сохранить расписание",
-        "no_lessons": "Уроков не добавлено. Нажмите 'Редактировать', чтобы заполнить день."
+        "no_lessons": "Уроков не добавлено. Нажмите 'Редактировать', чтобы заполнить день.",
+        "confirm_complete_title": "Подтверждение",
+        "confirm_complete_msg": "Точно выполнено?",
+        "btn_yes": "Да",
+        "btn_no": "Отмена",
+        "edit_hw_title": "Редактирование задания",
+        "field_subject": "Предмет:",
+        "field_deadline": "Дедлайн (ДД.ММ.ГГГГ):",
+        "field_description": "Описание задания:",
+        "btn_save_changes": "Сохранить изменения"
     }
 }
 
 DAYS_UA = ["Понеділок", "Вівторок", "Середа", "Четвер", "П'ятниця", "Субота", "Неділя"]
+
+# Неділю в сітці розкладу не показуємо — рівно 6 днів ділиться на 3x2.
+SCHEDULE_DAYS = DAYS_UA[:6]
+SCHEDULE_GRID_COLS = 3
+SCHEDULE_GRID_ROWS = 2
 
 LESSON_NAME_MAX_LEN = 40
 
@@ -55,6 +80,134 @@ def limit_entry_length(entry: ctk.CTkEntry, max_len: int):
 
     entry.bind("<KeyRelease>", _enforce, add="+")
     entry.bind("<<Paste>>", lambda e: entry.after(1, _enforce), add="+")
+
+# ================== ВІКНО ПІДТВЕРДЖЕННЯ ДІЇ ==================
+class ConfirmDialog(ctk.CTkToplevel):
+    """Невелике модальне вікно з питанням і кнопками Так/Скасувати —
+    використовується, щоб не дати випадково натиснути 'Виконано'."""
+    def __init__(self, parent, title: str, message: str, yes_text: str, no_text: str, on_confirm):
+        super().__init__(parent)
+        self.on_confirm = on_confirm
+
+        self.title(title)
+        self.geometry("360x150")
+        self.resizable(False, False)
+        self.grab_set()
+
+        lbl = ctk.CTkLabel(self, text=message, font=("Arial", 14), wraplength=300, justify="center")
+        lbl.pack(pady=(28, 15), padx=20)
+
+        btn_frame = ctk.CTkFrame(self, fg_color="transparent")
+        btn_frame.pack(pady=5)
+
+        btn_yes = ctk.CTkButton(
+            btn_frame, text=yes_text, width=110,
+            fg_color="#2ECC71", hover_color="#27AE60",
+            command=self._confirm
+        )
+        btn_yes.pack(side="left", padx=8)
+
+        btn_no = ctk.CTkButton(
+            btn_frame, text=no_text, width=110,
+            fg_color="#7F8C8D", hover_color="#616A6B",
+            command=self.destroy
+        )
+        btn_no.pack(side="left", padx=8)
+
+        self.update_idletasks()
+        try:
+            px = parent.winfo_x() + (parent.winfo_width() // 2) - 180
+            py = parent.winfo_y() + (parent.winfo_height() // 2) - 75
+            self.geometry(f"+{px}+{py}")
+        except Exception:
+            pass
+
+    def _confirm(self):
+        self.destroy()
+        self.on_confirm()
+
+# ================== ВІКНО РЕДАГУВАННЯ ЗАВДАННЯ ==================
+class EditHomeworkDialog(ctk.CTkToplevel):
+    """Компактне вікно редагування вже доданого завдання. Попередньо
+    заповнюється поточними даними, а збереження йде через ту саму
+    валідацію/ШІ-перевірку, що й додавання нового завдання."""
+    def __init__(self, parent, task: dict, on_saved):
+        super().__init__(parent)
+        self.parent_app = parent
+        self.task = task
+        self.on_saved = on_saved
+
+        t = TRANSLATIONS[parent.current_lang]
+        self.title(t["edit_hw_title"])
+        self.geometry("380x360")
+        self.resizable(False, False)
+        self.grab_set()
+
+        ctk.CTkLabel(self, text=t["field_subject"], anchor="w").pack(fill="x", padx=20, pady=(18, 0))
+        self.combo_subject = ctk.CTkOptionMenu(self, values=parent.db.get_all_subjects())
+        self.combo_subject.set(task.get("subject", ""))
+        self.combo_subject.pack(fill="x", padx=20, pady=(2, 0))
+
+        ctk.CTkLabel(self, text=t["field_deadline"], anchor="w").pack(fill="x", padx=20, pady=(14, 0))
+        self.entry_deadline = ctk.CTkEntry(self)
+        self.entry_deadline.insert(0, task.get("deadline", ""))
+        self.entry_deadline.pack(fill="x", padx=20, pady=(2, 0))
+
+        ctk.CTkLabel(self, text=t["field_description"], anchor="w").pack(fill="x", padx=20, pady=(14, 0))
+        self.entry_desc = ctk.CTkEntry(self)
+        self.entry_desc.insert(0, task.get("description", ""))
+        self.entry_desc.pack(fill="x", padx=20, pady=(2, 0))
+
+        btn_save = ctk.CTkButton(
+            self, text=t["btn_save_changes"],
+            fg_color="#2ECC71", hover_color="#27AE60",
+            command=self.save_action
+        )
+        btn_save.pack(pady=24)
+
+        self.update_idletasks()
+        try:
+            px = parent.winfo_x() + (parent.winfo_width() // 2) - 190
+            py = parent.winfo_y() + (parent.winfo_height() // 2) - 180
+            self.geometry(f"+{px}+{py}")
+        except Exception:
+            pass
+
+    def save_action(self):
+        subject = self.combo_subject.get()
+        deadline_raw = self.entry_deadline.get().strip()
+        desc = self.entry_desc.get().strip()
+
+        # Модель могла ще не бути завантажена — той самий лінивий сценарій,
+        # що й при доданні нового завдання.
+        if self.parent_app.ai.needs_loading():
+            self.parent_app._load_ai_model_then(lambda: self._validate_and_save(subject, deadline_raw, desc))
+            return
+
+        self._validate_and_save(subject, deadline_raw, desc)
+
+    def _validate_and_save(self, subject, deadline_raw, desc):
+        t = TRANSLATIONS[self.parent_app.current_lang]
+
+        is_valid, msg = self.parent_app.ai.validate_homework(desc, lang=self.parent_app.current_lang)
+        if not is_valid:
+            messagebox.showwarning(t["warn_title"], msg)
+            return
+
+        try:
+            deadline_date = datetime.strptime(deadline_raw, "%d.%m.%Y").date()
+        except ValueError:
+            err_msg = "Невірний формат дедлайну! Використовуйте ДД.ММ.РРРР" if self.parent_app.current_lang == "UA" else "Неверный формат дедлайна! Используйте ДД.ММ.ГГГГ"
+            messagebox.showwarning(t["warn_title"], err_msg)
+            return
+
+        updated_task = dict(self.task)
+        updated_task["subject"] = subject
+        updated_task["deadline"] = deadline_date.strftime("%d.%m.%Y")
+        updated_task["description"] = desc
+
+        self.on_saved(updated_task)
+        self.destroy()
 
 # ================== ОКНО ЗАВАНТАЖЕННЯ ШІ-МОДЕЛІ ==================
 class ModelLoadingDialog(ctk.CTkToplevel):
@@ -374,44 +527,80 @@ class App(ctk.CTk):
             child.destroy()
 
         t = TRANSLATIONS[self.current_lang]
-        tasks = [item for item in self.db.get_homework() if not item.get("completed", False)]
+        # Список завжди показуємо відсортованим за пріоритетом: прострочені
+        # зверху, далі "гарячі" (дедлайн сьогодні/завтра або проект/реферат),
+        # решта — за наближенням дедлайну. Порядок збереження на диску не
+        # чіпаємо — це лише порядок відображення.
+        tasks = self.ai.sort_tasks(self.db.get_homework())
         today_str = datetime.now().strftime("%d.%m.%Y")
 
         self.today_buttons = []
 
         for idx, task in enumerate(tasks):
             is_today = (task['deadline'] == today_str)
-            
-            card = ctk.CTkFrame(self.scroll_hw, border_width=2 if is_today else 0, border_color="#2ECC71" if is_today else "#333333")
+            is_overdue = self.ai.is_overdue_task(task)
+            is_urgent = self.ai.is_urgent_task(task)
+
+            if is_urgent:
+                border_width, border_color = 2, "#E74C3C"
+            elif is_today:
+                border_width, border_color = 2, "#2ECC71"
+            else:
+                border_width, border_color = 0, "#333333"
+
+            card = ctk.CTkFrame(self.scroll_hw, border_width=border_width, border_color=border_color)
             card.pack(fill="x", padx=5, pady=5)
 
-            prefix = f"{t['today_tag']} " if is_today else ""
+            if is_overdue:
+                prefix = f"{t['overdue_tag']} "
+            elif is_today:
+                prefix = f"{t['today_tag']} "
+            else:
+                prefix = ""
             info_text = f"{prefix}[{task['subject']}] (до {task['deadline']})\n{task['description']}"
-            
-            lbl = ctk.CTkLabel(card, text=info_text, justify="left", anchor="w", font=("Arial", 13, "bold" if is_today else "normal"))
+
+            lbl = ctk.CTkLabel(card, text=info_text, justify="left", anchor="w", font=("Arial", 13, "bold" if (is_today or is_overdue) else "normal"))
             lbl.pack(side="left", padx=10, pady=8, expand=True, fill="x")
 
+            # Кнопки праворуч: спершу пакуємо "Виконано" (буде крайнім
+            # правим), потім "✕" — вона стане лівіше від нього.
+            btn_done = ctk.CTkButton(
+                card,
+                text=t["btn_complete"],
+                fg_color="#2ECC71",
+                hover_color="#27AE60",
+                width=110,
+                command=lambda task_id=task['id']: self.confirm_complete_task(task_id)
+            )
+            btn_done.pack(side="right", padx=(5, 10), pady=5)
             if is_today:
-                btn_done = ctk.CTkButton(
-                    card, 
-                    text=t["btn_complete"], 
-                    fg_color="#2ECC71", 
-                    hover_color="#27AE60",
-                    width=110,
-                    command=lambda task_id=task['id']: self.complete_task(task_id)
-                )
-                btn_done.pack(side="right", padx=10, pady=5)
                 self.today_buttons.append(btn_done)
-            else:
-                btn_del = ctk.CTkButton(
-                    card, 
-                    text="✕", 
-                    width=35, 
-                    fg_color="#E74C3C", 
-                    hover_color="#C0392B",
-                    command=lambda task_id=task['id']: self.delete_task(task_id)
-                )
-                btn_del.pack(side="right", padx=10, pady=5)
+
+            btn_edit = ctk.CTkButton(
+                card,
+                text="✏️",
+                width=35,
+                fg_color="#34495E",
+                hover_color="#2C3E50",
+                command=lambda task_data=task: self.open_edit_homework_dialog(task_data)
+            )
+            btn_edit.pack(side="right", padx=5, pady=5)
+
+            btn_del = ctk.CTkButton(
+                card,
+                text="✕",
+                width=35,
+                fg_color="#E74C3C",
+                hover_color="#C0392B",
+                command=lambda task_id=task['id']: self.delete_task(task_id)
+            )
+            btn_del.pack(side="right", padx=(0, 5), pady=5)
+
+            # "❗" — одразу після тексту, перед кнопками, для "гарячих"
+            # завдань (дедлайн менш ніж за 2 дні, або тип проект/реферат).
+            if is_urgent:
+                lbl_alert = ctk.CTkLabel(card, text="❗", text_color="#E74C3C", font=("Arial", 20, "bold"))
+                lbl_alert.pack(side="right", padx=(0, 5))
 
     def _animate_today_buttons(self):
         self.pulse_state = not self.pulse_state
@@ -426,6 +615,17 @@ class App(ctk.CTk):
         
         self.after(800, self._animate_today_buttons)
 
+    def confirm_complete_task(self, task_id):
+        t = TRANSLATIONS[self.current_lang]
+        ConfirmDialog(
+            self,
+            title=t["confirm_complete_title"],
+            message=t["confirm_complete_msg"],
+            yes_text=t["btn_yes"],
+            no_text=t["btn_no"],
+            on_confirm=lambda: self.complete_task(task_id)
+        )
+
     def complete_task(self, task_id):
         tasks = self.db.get_homework()
         for task in tasks:
@@ -438,6 +638,21 @@ class App(ctk.CTk):
     def delete_task(self, task_id):
         tasks = [t for t in self.db.get_homework() if t['id'] != task_id]
         self.db.save_homework(tasks)
+        self.refresh_all_data()
+
+    def open_edit_homework_dialog(self, task):
+        EditHomeworkDialog(self, task, self.save_edited_homework)
+
+    def save_edited_homework(self, updated_task):
+        tasks = self.db.get_homework()
+        for i, task in enumerate(tasks):
+            if task['id'] == updated_task['id']:
+                tasks[i] = updated_task
+                break
+        self.db.save_homework(tasks)
+        # refresh_all_data -> refresh_homework_list заново пропускає кожну
+        # задачу через ai.sort_tasks/is_urgent_task/is_overdue_task, тож
+        # пріоритет, сортування і візуальні акценти перебудуються самі.
         self.refresh_all_data()
 
     # ================== ВКЛАДКА: ДНЕВНИК И РАСПИСАНИЕ ==================
@@ -456,6 +671,12 @@ class App(ctk.CTk):
 
         self.scroll_schedule = ctk.CTkScrollableFrame(self.tab_schedule)
         self.scroll_schedule.pack(fill="both", expand=True, padx=10, pady=5)
+
+        # Сітка 3 колонки x 2 рядки під картки днів (Пн-Сб).
+        for col in range(SCHEDULE_GRID_COLS):
+            self.scroll_schedule.grid_columnconfigure(col, weight=1)
+        for row in range(SCHEDULE_GRID_ROWS):
+            self.scroll_schedule.grid_rowconfigure(row, weight=1)
 
     def prev_week(self):
         if self.selected_week_offset > -2:
@@ -478,78 +699,84 @@ class App(ctk.CTk):
         t = TRANSLATIONS[self.current_lang]
         dates = self.get_dates_for_current_view()
         start_str = dates[0].strftime("%d.%m")
-        end_str = dates[6].strftime("%d.%m.%Y")
+        end_str = dates[5].strftime("%d.%m.%Y")
         self.lbl_week_range.configure(text=f"Тиждень: {start_str} — {end_str}")
 
         schedule_data = self.db.get_schedule()
         all_hw = self.db.get_homework()
+        today = datetime.now().date()
 
-        # Отображаем 7 карточек дней (таблицы бумажного дневника)
-        for day_idx, day_name in enumerate(DAYS_UA):
+        # Сітка 3x2: 6 карток днів (Пн-Сб), неділя в UI не показується.
+        for day_idx, day_name in enumerate(SCHEDULE_DAYS):
             day_date = dates[day_idx]
             day_date_str = day_date.strftime("%d.%m.%Y")
-            is_today = (day_date == datetime.now().date())
+            is_today = (day_date == today)
+
+            grid_row, grid_col = divmod(day_idx, SCHEDULE_GRID_COLS)
 
             day_card = ctk.CTkFrame(
-                self.scroll_schedule, 
-                border_width=2 if is_today else 1, 
+                self.scroll_schedule,
+                border_width=2 if is_today else 1,
                 border_color="#2ECC71" if is_today else "#333333"
             )
-            day_card.pack(fill="x", padx=5, pady=8)
+            day_card.grid(row=grid_row, column=grid_col, padx=6, pady=6, sticky="nsew")
 
-            # Шапка дня дневника
+            # Шапка картки: назва дня + дата зліва, компактна кнопка
+            # редагування точно в куті справа.
             header_frame = ctk.CTkFrame(day_card, fg_color="transparent")
-            header_frame.pack(fill="x", padx=10, pady=5)
+            header_frame.pack(fill="x", padx=8, pady=(8, 4))
 
-            header_text = f"{day_name} ({day_date_str})" + (" — СЬОГОДНІ" if is_today else "")
+            header_text = f"{day_name}\n{day_date_str}" + (" 🔥" if is_today else "")
             lbl_header = ctk.CTkLabel(
-                header_frame, 
-                text=header_text, 
-                font=("Arial", 14, "bold"), 
+                header_frame,
+                text=header_text,
+                font=("Arial", 13, "bold"),
+                justify="left",
+                anchor="w",
                 text_color="#2ECC71" if is_today else None
             )
             lbl_header.pack(side="left")
 
-            # Кнопка быстрой настройки расписания для этого дня
             lessons = schedule_data.get(day_name, [])
             btn_edit = ctk.CTkButton(
-                header_frame, 
-                text="✎ Редагувати", 
-                width=100, 
-                height=24,
+                header_frame,
+                text="✎",
+                width=28,
+                height=28,
                 fg_color="#34495E",
                 hover_color="#2C3E50",
                 command=lambda d=day_name, l=lessons: self.open_edit_schedule_dialog(d, l)
             )
-            btn_edit.pack(side="right")
+            btn_edit.pack(side="right", anchor="ne")
 
-            # Таблица предметов дня (как в бумажном дневнике)
+            # Компактний список уроків картки
             if not lessons:
-                lbl_empty = ctk.CTkLabel(day_card, text=t["no_lessons"], text_color="gray", anchor="w")
-                lbl_empty.pack(padx=15, pady=5)
+                lbl_empty = ctk.CTkLabel(
+                    day_card, text=t["no_lessons"], text_color="gray",
+                    font=("Arial", 11), anchor="w", justify="left", wraplength=210
+                )
+                lbl_empty.pack(fill="x", padx=8, pady=(0, 8))
             else:
-                table_frame = ctk.CTkFrame(day_card, fg_color="transparent")
-                table_frame.pack(fill="x", padx=10, pady=5)
-
-                # Ищем домашние задания для этой конкретной даты
                 day_hws = [h for h in all_hw if h.get("deadline") == day_date_str]
 
+                lessons_frame = ctk.CTkFrame(day_card, fg_color="transparent")
+                lessons_frame.pack(fill="both", expand=True, padx=6, pady=(0, 6))
+
                 for lesson_idx, lesson_title in enumerate(lessons):
-                    row = ctk.CTkFrame(table_frame, fg_color="#2B2B2B" if self.current_theme=="Dark" else "#F0F0F0")
-                    row.pack(fill="x", pady=2)
+                    row = ctk.CTkFrame(lessons_frame, fg_color="#2B2B2B" if self.current_theme == "Dark" else "#F0F0F0")
+                    row.pack(fill="x", pady=1)
 
-                    lesson_row = ctk.CTkFrame(row, fg_color="transparent")
-                    lesson_row.pack(fill="x", padx=5, pady=(4, 0))
+                    lbl_sub = ctk.CTkLabel(
+                        row,
+                        text=f"{lesson_idx + 1}. {lesson_title}",
+                        anchor="w",
+                        justify="left",
+                        font=("Arial", 11, "bold"),
+                        wraplength=200
+                    )
+                    lbl_sub.pack(fill="x", padx=6, pady=(3, 0))
 
-                    # Номер урока
-                    lbl_num = ctk.CTkLabel(lesson_row, text=f"№ {lesson_idx+1}", width=45, font=("Arial", 12, "bold"))
-                    lbl_num.pack(side="left")
-
-                    # Название предмета
-                    lbl_sub = ctk.CTkLabel(lesson_row, text=lesson_title, anchor="w", font=("Arial", 13, "bold"))
-                    lbl_sub.pack(side="left", padx=5, fill="x", expand=True)
-
-                    # ДЗ к этому конкретному предмету (если есть) — выводим отдельной строкой под уроком
+                    # ДЗ до цього уроку (якщо є) — компактним рядком нижче
                     sub_hw = [h for h in day_hws if h.get("subject", "").lower() == lesson_title.lower()]
                     if sub_hw:
                         hw_items = []
@@ -565,15 +792,14 @@ class App(ctk.CTk):
                             text=hw_text,
                             anchor="w",
                             justify="left",
-                            wraplength=600,
-                            font=("Arial", 12),
+                            wraplength=190,
+                            font=("Arial", 10),
                             # М'який кораловий акцент для активної дз, зелений — коли все виконано
                             text_color="#2ECC71" if all_done else "#FF6F61"
                         )
-                        lbl_hw_desc.pack(fill="x", padx=(50, 10), pady=(0, 6))
+                        lbl_hw_desc.pack(fill="x", padx=6, pady=(0, 4))
                     else:
-                        # Невеликий відступ знизу, щоб урок без дз не "злипався" з наступним
-                        ctk.CTkLabel(row, text="", height=2).pack()
+                        ctk.CTkLabel(row, text="", height=1).pack()
 
     def open_edit_schedule_dialog(self, day_name, current_lessons):
         EditScheduleDialog(self, day_name, current_lessons, self.save_schedule_callback)
