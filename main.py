@@ -1,7 +1,8 @@
+import threading
 import customtkinter as ctk
 from tkinter import messagebox
 from datetime import datetime, timedelta
-from data_manager import DataManager
+from data_manager import DataManager, SUBJECT_ALIASES, is_known_subject_alias, suggest_subject_correction
 from ai_engine import AIEngine
 
 ctk.set_appearance_mode("Dark")
@@ -42,10 +43,61 @@ TRANSLATIONS = {
 
 DAYS_UA = ["Понеділок", "Вівторок", "Середа", "Четвер", "П'ятниця", "Субота", "Неділя"]
 
+LESSON_NAME_MAX_LEN = 40
+
+
+def limit_entry_length(entry: ctk.CTkEntry, max_len: int):
+    """Обрізає текст поля, якщо він перевищує max_len (в т.ч. після вставки з буфера)."""
+    def _enforce(event=None):
+        value = entry.get()
+        if len(value) > max_len:
+            entry.delete(max_len, "end")
+
+    entry.bind("<KeyRelease>", _enforce, add="+")
+    entry.bind("<<Paste>>", lambda e: entry.after(1, _enforce), add="+")
+
+# ================== ОКНО ЗАВАНТАЖЕННЯ ШІ-МОДЕЛІ ==================
+class ModelLoadingDialog(ctk.CTkToplevel):
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.title("")
+        self.geometry("380x150")
+        self.resizable(False, False)
+
+        # Забороняємо закриття хрестиком — очікуємо завершення фонового потоку
+        self.protocol("WM_DELETE_WINDOW", lambda: None)
+        self.grab_set()
+
+        lbl = ctk.CTkLabel(
+            self,
+            text="Завантаження локальної моделі ШІ...\n(Це потрібно лише один раз після запуску)",
+            font=("Arial", 13),
+            justify="center",
+        )
+        lbl.pack(pady=(28, 15), padx=20)
+
+        self.progress = ctk.CTkProgressBar(self, mode="indeterminate", width=280)
+        self.progress.pack(pady=5)
+        self.progress.start()
+
+        self.update_idletasks()
+        try:
+            px = parent.winfo_x() + (parent.winfo_width() // 2) - 190
+            py = parent.winfo_y() + (parent.winfo_height() // 2) - 75
+            self.geometry(f"+{px}+{py}")
+        except Exception:
+            pass
+
+    def close(self):
+        self.progress.stop()
+        self.grab_release()
+        self.destroy()
+
 # ================== ОКНО РЕДАКТИРОВАНИЯ ДНЯ (ДНЕВНИК) ==================
 class EditScheduleDialog(ctk.CTkToplevel):
     def __init__(self, parent, day_name, current_lessons, on_save_callback):
         super().__init__(parent)
+        self.parent_app = parent
         self.day_name = day_name
         self.on_save_callback = on_save_callback
         
@@ -76,6 +128,7 @@ class EditScheduleDialog(ctk.CTkToplevel):
             entry = ctk.CTkEntry(row_frame, placeholder_text="Назва предмета...")
             entry.insert(0, val)
             entry.pack(side="left", fill="x", expand=True, padx=5)
+            limit_entry_length(entry, LESSON_NAME_MAX_LEN)
 
             self.inputs.append(entry)
 
@@ -84,8 +137,36 @@ class EditScheduleDialog(ctk.CTkToplevel):
 
     def save_action(self):
         new_lessons = [e.get().strip() for e in self.inputs if e.get().strip()]
-        self.on_save_callback(self.day_name, new_lessons)
-        self.destroy()
+        # Порівнюємо як з уже вживаними в розкладі предметами, так і з
+        # вбудованим словником канонічних назв — щоб ловити помилки навіть
+        # у ще жодного разу не введеного предмета.
+        known_subjects = list(set(self.parent_app.db.get_all_subjects()) | set(SUBJECT_ALIASES.keys()))
+
+        final_lessons = []
+        for lesson in new_lessons:
+            # Відомий синонім (наприклад, "Англ мова") мовчки нормалізується
+            # пізніше при збереженні — тут питати користувача не потрібно.
+            if is_known_subject_alias(lesson):
+                final_lessons.append(lesson)
+                continue
+
+            suggestion = suggest_subject_correction(lesson, known_subjects)
+            if suggestion:
+                use_suggestion = messagebox.askyesno(
+                    "Можлива помилка у назві предмета",
+                    f"Ви ввели «{lesson}».\nМожливо, ви мали на увазі «{suggestion}»?\n\n"
+                    f"Використати «{suggestion}»?"
+                )
+                final_lessons.append(suggestion if use_suggestion else lesson)
+            else:
+                final_lessons.append(lesson)
+
+        try:
+            self.on_save_callback(self.day_name, final_lessons)
+        except Exception as e:
+            messagebox.showerror("Помилка", f"Не вдалося зберегти розклад: {e}")
+        finally:
+            self.destroy()
 
 # ================== ГЛАВНОЕ ОКНО ==================
 class App(ctk.CTk):
@@ -212,19 +293,58 @@ class App(ctk.CTk):
             self.combo_subject.set(subjects[0])
 
     def add_homework_action(self):
-        t = TRANSLATIONS[self.current_lang]
         subject = self.combo_subject.get()
-        deadline = self.entry_deadline.get().strip()
-        desc = self.entry_desc.get()
+        deadline_raw = self.entry_deadline.get().strip()
+        desc = self.entry_desc.get().strip()
+
+        if self.ai.needs_loading():
+            self._load_ai_model_then(lambda: self._finish_add_homework(subject, deadline_raw, desc))
+            return
+
+        self._finish_add_homework(subject, deadline_raw, desc)
+
+    def _load_ai_model_then(self, callback):
+        """Показує модальне вікно і вантажить модель у фоновому потоці,
+        щоб інтерфейс не завис на важкій ініціалізації llama.cpp."""
+        dialog = ModelLoadingDialog(self)
+        state = {"done": False}
+
+        def worker():
+            self.ai.load_model()
+            state["done"] = True
+
+        threading.Thread(target=worker, daemon=True).start()
+
+        def poll():
+            if state["done"]:
+                dialog.close()
+                callback()
+            else:
+                self.after(100, poll)
+
+        self.after(100, poll)
+
+    def _finish_add_homework(self, subject, deadline_raw, desc):
+        t = TRANSLATIONS[self.current_lang]
 
         is_valid, msg = self.ai.validate_homework(desc, lang=self.current_lang)
         if not is_valid:
             messagebox.showwarning(t["warn_title"], msg)
             return
 
-        if not deadline:
-            tomorrow = datetime.now().date() + timedelta(days=1)
-            deadline = tomorrow.strftime("%d.%m.%Y")
+        if not deadline_raw:
+            deadline_date = datetime.now().date() + timedelta(days=1)
+        else:
+            try:
+                deadline_date = datetime.strptime(deadline_raw, "%d.%m.%Y").date()
+            except ValueError:
+                err_msg = "Невірний формат дедлайну! Використовуйте ДД.ММ.РРРР" if self.current_lang == "UA" else "Неверный формат дедлайна! Используйте ДД.ММ.ГГГГ"
+                messagebox.showwarning(t["warn_title"], err_msg)
+                return
+
+        # Нормалізуємо дедлайн до єдиного формату з нулями (05.09.2026),
+        # інакше рядкове порівняння дат у розкладі не спрацює.
+        deadline = deadline_date.strftime("%d.%m.%Y")
 
         new_task = {
             "id": str(datetime.now().timestamp()),
@@ -262,7 +382,7 @@ class App(ctk.CTk):
         for idx, task in enumerate(tasks):
             is_today = (task['deadline'] == today_str)
             
-            card = ctk.CTkFrame(self.scroll_hw, border_width=2 if is_today else 0, border_color="#2ECC71" if is_today else "transparent")
+            card = ctk.CTkFrame(self.scroll_hw, border_width=2 if is_today else 0, border_color="#2ECC71" if is_today else "#333333")
             card.pack(fill="x", padx=5, pady=5)
 
             prefix = f"{t['today_tag']} " if is_today else ""
@@ -418,31 +538,42 @@ class App(ctk.CTk):
                     row = ctk.CTkFrame(table_frame, fg_color="#2B2B2B" if self.current_theme=="Dark" else "#F0F0F0")
                     row.pack(fill="x", pady=2)
 
+                    lesson_row = ctk.CTkFrame(row, fg_color="transparent")
+                    lesson_row.pack(fill="x", padx=5, pady=(4, 0))
+
                     # Номер урока
-                    lbl_num = ctk.CTkLabel(row, text=f"№ {lesson_idx+1}", width=45, font=("Arial", 12, "bold"))
-                    lbl_num.pack(side="left", padx=5)
+                    lbl_num = ctk.CTkLabel(lesson_row, text=f"№ {lesson_idx+1}", width=45, font=("Arial", 12, "bold"))
+                    lbl_num.pack(side="left")
 
                     # Название предмета
-                    lbl_sub = ctk.CTkLabel(row, text=lesson_title, width=150, anchor="w", font=("Arial", 13, "bold"))
-                    lbl_sub.pack(side="left", padx=5)
+                    lbl_sub = ctk.CTkLabel(lesson_row, text=lesson_title, anchor="w", font=("Arial", 13, "bold"))
+                    lbl_sub.pack(side="left", padx=5, fill="x", expand=True)
 
-                    # ДЗ к этому конкретному предмету (если есть)
+                    # ДЗ к этому конкретному предмету (если есть) — выводим отдельной строкой под уроком
                     sub_hw = [h for h in day_hws if h.get("subject", "").lower() == lesson_title.lower()]
-                    hw_text = ""
                     if sub_hw:
                         hw_items = []
+                        all_done = True
                         for h in sub_hw:
-                            status = "✓" if h.get("completed") else "📌"
-                            hw_items.append(f"{status} {h['description']}")
+                            done = h.get("completed", False)
+                            hw_items.append(f"{'✓' if done else '📌'} {h['description']}")
+                            all_done = all_done and done
                         hw_text = " | ".join(hw_items)
 
-                    lbl_hw_desc = ctk.CTkLabel(
-                        row, 
-                        text=hw_text, 
-                        anchor="w", 
-                        text_color="#2ECC71" if "✓" in hw_text else ("#E67E22" if hw_text else "gray")
-                    )
-                    lbl_hw_desc.pack(side="left", padx=10, fill="x", expand=True)
+                        lbl_hw_desc = ctk.CTkLabel(
+                            row,
+                            text=hw_text,
+                            anchor="w",
+                            justify="left",
+                            wraplength=600,
+                            font=("Arial", 12),
+                            # М'який кораловий акцент для активної дз, зелений — коли все виконано
+                            text_color="#2ECC71" if all_done else "#FF6F61"
+                        )
+                        lbl_hw_desc.pack(fill="x", padx=(50, 10), pady=(0, 6))
+                    else:
+                        # Невеликий відступ знизу, щоб урок без дз не "злипався" з наступним
+                        ctk.CTkLabel(row, text="", height=2).pack()
 
     def open_edit_schedule_dialog(self, day_name, current_lessons):
         EditScheduleDialog(self, day_name, current_lessons, self.save_schedule_callback)
